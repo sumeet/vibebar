@@ -1,0 +1,13 @@
+[package]
+name = "vibebar"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+iced = { version = "*", features = ["image", "tokio", "svg"] }
+iced_layershell = "*"
+system-tray = "*"
+tokio = { version = "*", features = ["rt-multi-thread", "macros", "time"] }
+freedesktop-icons = "*"
+image_crate = { package = "image", version = "*" }
+zbus = "*"
