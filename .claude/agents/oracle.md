@@ -84,8 +84,8 @@ async (page) => {
     return { error: 'LOGIN_REQUIRED', message: 'ChatGPT requires login. Please log in via the browser window.' };
   }
 
-  // Select model if needed (only for new chats, and only if not default thinking)
-  if (!THREAD_URL && MODE !== 'thinking') {
+  // Always explicitly select model for new chats (browser may have retained previous mode)
+  if (!THREAD_URL) {
     // Click model selector dropdown
     const modelSelector = page.getByTestId('model-switcher-dropdown-button');
     await modelSelector.click();
@@ -94,10 +94,13 @@ async (page) => {
     if (MODE === 'pro') {
       await page.getByTestId('model-switcher-gpt-5-2-pro').click();
     } else if (MODE === 'thinking-extended') {
-      // TODO: Find exact testid for thinking-extended when needed
-      await page.locator('[data-testid*="thinking"]').click();
+      // TODO: Find exact testid/flow for thinking-extended when needed
+      await page.getByTestId('model-switcher-gpt-5-2-thinking').click();
       await page.waitForTimeout(300);
       await page.locator('text=Extended').click();
+    } else {
+      // Default: thinking (standard)
+      await page.getByTestId('model-switcher-gpt-5-2-thinking').click();
     }
     await page.waitForTimeout(500);
   }
@@ -152,13 +155,7 @@ async (page) => {
     return '';
   });
 
-  const resultUrl = page.url();
-
-  // Navigate away to minimize the page snapshot size in MCP response
-  // (The MCP tool auto-appends page state, which can be 10k+ tokens)
-  await page.goto('about:blank');
-
-  return { response, thinkingTime, url: resultUrl };
+  return { response, thinkingTime, url: page.url() };
 }
 ```
 

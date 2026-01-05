@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use iced::widget::{Space, button, container, image, row, svg};
-use iced::{Border, Color, Element, Length, Subscription, Theme};
+use iced::widget::{Space, container, image, mouse_area, row, svg};
+use iced::{Background, Border, Color, Element, Length, Subscription, Theme};
 
 use iced_layershell::application;
 use iced_layershell::reexport::Anchor;
@@ -15,8 +15,8 @@ use system_tray::item::IconPixmap;
 use tokio::sync::mpsc;
 use zbus::Connection;
 
-// Channel for sending activation requests to the subscription (address, x, y)
-static ACTIVATE_TX: OnceLock<mpsc::UnboundedSender<(String, i32, i32)>> = OnceLock::new();
+// Channel for sending activation requests to the subscription (address, click_type, x, y)
+static ACTIVATE_TX: OnceLock<mpsc::UnboundedSender<(String, ClickType, i32, i32)>> = OnceLock::new();
 
 // Design constants
 const BAR_BG: Color = Color::from_rgb(9.0 / 255.0, 9.0 / 255.0, 11.0 / 255.0);
@@ -38,11 +38,19 @@ enum TrayEvent {
     Tick, // Used for internal state machine transitions
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClickType {
+    Left,
+    Right,
+    Middle,
+}
+
 #[to_layer_message]
 #[derive(Debug, Clone)]
 enum Message {
     Tray(TrayEvent),
-    TrayIconClicked(String), // address
+    TrayIconClicked(String, ClickType), // address, click type
+    TrayIconHover(String, bool),         // address, is_hovered
     MouseMoved(iced::Point),
 }
 
@@ -53,6 +61,7 @@ enum IconHandle {
 
 struct TrayItem {
     icon: Option<IconHandle>,
+    hovered: bool,
 }
 
 struct State {
@@ -79,21 +88,25 @@ fn update(state: &mut State, msg: Message) -> iced::Task<Message> {
         Message::Tray(event) => match event {
             TrayEvent::Add { address, icon } | TrayEvent::Update { address, icon } => {
                 let icon_handle = resolve_icon(&icon);
+                let hovered = state.tray_items.get(&address).map(|i| i.hovered).unwrap_or(false);
                 state
                     .tray_items
-                    .insert(address, TrayItem { icon: icon_handle });
+                    .insert(address, TrayItem { icon: icon_handle, hovered });
             }
             TrayEvent::Remove { address } => {
                 state.tray_items.remove(&address);
             }
             TrayEvent::Tick => {}
         },
-        Message::TrayIconClicked(address) => {
+        Message::TrayIconClicked(address, click_type) => {
             if let Some(tx) = ACTIVATE_TX.get() {
-                // Use window-relative mouse position
-                // (Waybar uses screen coords but those are hard to get on Wayland)
                 let (x, y) = state.mouse_position;
-                let _ = tx.send((address, x as i32, y as i32));
+                let _ = tx.send((address, click_type, x as i32, y as i32));
+            }
+        }
+        Message::TrayIconHover(address, is_hovered) => {
+            if let Some(item) = state.tray_items.get_mut(&address) {
+                item.hovered = is_hovered;
             }
         }
         Message::MouseMoved(point) => {
@@ -192,12 +205,10 @@ fn load_png(path: &PathBuf) -> Option<image::Handle> {
     Some(image::Handle::from_rgba(w, h, rgba.into_raw()))
 }
 
-fn tray_icon_button_style(_theme: &Theme, status: button::Status) -> button::Style {
-    let is_hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
-
-    if is_hovered {
-        button::Style {
-            background: Some(Color::from_rgba(1.0, 1.0, 1.0, 0.20).into()),
+fn tray_icon_container_style(hovered: bool) -> container::Style {
+    if hovered {
+        container::Style {
+            background: Some(Background::Color(Color::from_rgba(1.0, 1.0, 1.0, 0.20))),
             border: Border {
                 radius: 8.0.into(),
                 width: 1.0,
@@ -206,7 +217,7 @@ fn tray_icon_button_style(_theme: &Theme, status: button::Status) -> button::Sty
             ..Default::default()
         }
     } else {
-        button::Style::default()
+        container::Style::default()
     }
 }
 
@@ -227,16 +238,26 @@ fn view(state: &State) -> Element<'_, Message> {
                         .into(),
                 };
 
-                button(
+                let hovered = item.hovered;
+                let addr = address.clone();
+                let addr2 = address.clone();
+                let addr3 = address.clone();
+                let addr4 = address.clone();
+                let addr5 = address.clone();
+
+                mouse_area(
                     container(icon_widget)
                         .width(Length::Fixed(CONTAINER_SIZE))
                         .height(Length::Fixed(CONTAINER_SIZE))
                         .center_x(Length::Fixed(CONTAINER_SIZE))
-                        .center_y(Length::Fixed(CONTAINER_SIZE)),
+                        .center_y(Length::Fixed(CONTAINER_SIZE))
+                        .style(move |_| tray_icon_container_style(hovered)),
                 )
-                .on_press(Message::TrayIconClicked(address.clone()))
-                .style(tray_icon_button_style)
-                .padding(0)
+                .on_press(Message::TrayIconClicked(addr, ClickType::Left))
+                .on_right_press(Message::TrayIconClicked(addr2, ClickType::Right))
+                .on_middle_press(Message::TrayIconClicked(addr3, ClickType::Middle))
+                .on_enter(Message::TrayIconHover(addr4, true))
+                .on_exit(Message::TrayIconHover(addr5, false))
                 .into()
             })
         })
@@ -326,6 +347,22 @@ async fn sni_context_menu(bus_name: &str, x: i32, y: i32) -> zbus::Result<()> {
         .await?;
 
     proxy.call::<_, (i32, i32), ()>("ContextMenu", &(x, y)).await?;
+    Ok(())
+}
+
+async fn sni_secondary_activate(bus_name: &str, x: i32, y: i32) -> zbus::Result<()> {
+    let full_address = lookup_full_sni_address(bus_name).await?;
+    let (dest, path) = parse_sni_address(&full_address);
+
+    let conn = Connection::session().await?;
+    let proxy: zbus::Proxy<'_> = zbus::proxy::Builder::new(&conn)
+        .destination(dest)?
+        .path(path.as_str())?
+        .interface("org.kde.StatusNotifierItem")?
+        .build()
+        .await?;
+
+    proxy.call::<_, (i32, i32), ()>("SecondaryActivate", &(x, y)).await?;
     Ok(())
 }
 
@@ -460,22 +497,30 @@ fn tray_subscription() -> impl iced::futures::Stream<Item = Message> {
                         }
                     }
                     // Handle activation requests from UI
-                    Some((address, x, y)) = activate_rx.recv() => {
-                        // Check item_is_menu flag
-                        let item_is_menu = {
-                            let items = client.items();
-                            let guard = items.lock().unwrap();
-                            guard.get(&address)
-                                .map(|(item, _)| item.item_is_menu)
-                                .unwrap_or(false)
-                        };
-                        if item_is_menu {
-                            let _ = sni_context_menu(&address, x, y).await;
-                        } else {
-                            // Use our own Activate call (system-tray crate has path bug)
-                            if sni_activate(&address, x, y).await.is_err() {
-                                // Try ContextMenu as fallback
+                    Some((address, click_type, x, y)) = activate_rx.recv() => {
+                        match click_type {
+                            ClickType::Left => {
+                                // Check item_is_menu flag
+                                let item_is_menu = {
+                                    let items = client.items();
+                                    let guard = items.lock().unwrap();
+                                    guard.get(&address)
+                                        .map(|(item, _)| item.item_is_menu)
+                                        .unwrap_or(false)
+                                };
+                                if item_is_menu {
+                                    let _ = sni_context_menu(&address, x, y).await;
+                                } else {
+                                    if sni_activate(&address, x, y).await.is_err() {
+                                        let _ = sni_context_menu(&address, x, y).await;
+                                    }
+                                }
+                            }
+                            ClickType::Right => {
                                 let _ = sni_context_menu(&address, x, y).await;
+                            }
+                            ClickType::Middle => {
+                                let _ = sni_secondary_activate(&address, x, y).await;
                             }
                         }
                         Some((
@@ -494,14 +539,14 @@ enum TrayState {
     SendingInitial {
         client: Client,
         rx: tokio::sync::broadcast::Receiver<Event>,
-        activate_rx: mpsc::UnboundedReceiver<(String, i32, i32)>,
+        activate_rx: mpsc::UnboundedReceiver<(String, ClickType, i32, i32)>,
         initial: Vec<(String, IconData)>,
         index: usize,
     },
     Connected {
         client: Client,
         rx: tokio::sync::broadcast::Receiver<Event>,
-        activate_rx: mpsc::UnboundedReceiver<(String, i32, i32)>,
+        activate_rx: mpsc::UnboundedReceiver<(String, ClickType, i32, i32)>,
     },
 }
 
