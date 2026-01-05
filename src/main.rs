@@ -5,10 +5,11 @@ use std::sync::OnceLock;
 use iced::widget::{Space, container, image, mouse_area, row, svg};
 use iced::{Background, Border, Color, Element, Length, Subscription, Theme};
 
-use iced_layershell::application;
+use iced::window;
+use iced_layershell::actions::{IcedNewPopupSettings, LayershellCustomAction, LayershellCustomActionWithId};
 use iced_layershell::reexport::Anchor;
 use iced_layershell::settings::{LayerShellSettings, Settings, StartMode};
-use iced_layershell::to_layer_message;
+use iced_layershell::daemon;
 
 use system_tray::client::{Client, Event, UpdateEvent};
 use system_tray::item::IconPixmap;
@@ -45,13 +46,41 @@ enum ClickType {
     Middle,
 }
 
-#[to_layer_message]
+// Manual Message enum - NOT using to_layer_message macro so we can control popup parenting
 #[derive(Debug, Clone)]
 enum Message {
     Tray(TrayEvent),
     TrayIconClicked(String, ClickType), // address, click type
     TrayIconHover(String, bool),         // address, is_hovered
     MouseMoved(iced::Point),
+    ClosePopup,
+    WindowResized(window::Id, iced::Size),
+    // Layershell actions with explicit parent control
+    OpenPopup { parent: window::Id, popup: window::Id, settings: IcedNewPopupSettings },
+    CloseWindow(window::Id),
+}
+
+// Manual TryInto impl to specify parent ID for popups
+impl TryInto<LayershellCustomActionWithId> for Message {
+    type Error = Self;
+
+    fn try_into(self) -> Result<LayershellCustomActionWithId, Self::Error> {
+        match self {
+            Message::OpenPopup { parent, popup, settings } => Ok(
+                LayershellCustomActionWithId::new(
+                    Some(parent),
+                    LayershellCustomAction::NewPopUp { settings, id: popup },
+                )
+            ),
+            Message::CloseWindow(id) => Ok(
+                LayershellCustomActionWithId::new(
+                    Some(id),
+                    LayershellCustomAction::RemoveWindow,
+                )
+            ),
+            other => Err(other),
+        }
+    }
 }
 
 enum IconHandle {
@@ -67,6 +96,10 @@ struct TrayItem {
 struct State {
     tray_items: HashMap<String, TrayItem>,
     mouse_position: (f32, f32),
+    main_bar_id: Option<window::Id>,   // The main bar window ID (for parenting popups)
+    bar_width: u32,                    // Actual bar width from Resized events
+    active_popup: Option<window::Id>,  // Current popup window (only one at a time)
+    popup_for_address: Option<String>, // Which tray item's popup is open
 }
 
 fn init() -> (State, iced::Task<Message>) {
@@ -74,6 +107,10 @@ fn init() -> (State, iced::Task<Message>) {
         State {
             tray_items: HashMap::new(),
             mouse_position: (0.0, 0.0),
+            main_bar_id: None, // Will be set on first Resized event
+            bar_width: 1920,   // Default, will be updated on first Resized event
+            active_popup: None,
+            popup_for_address: None,
         },
         iced::Task::none(),
     )
@@ -99,9 +136,77 @@ fn update(state: &mut State, msg: Message) -> iced::Task<Message> {
             TrayEvent::Tick => {}
         },
         Message::TrayIconClicked(address, click_type) => {
-            if let Some(tx) = ACTIVATE_TX.get() {
-                let (x, y) = state.mouse_position;
-                let _ = tx.send((address, click_type, x as i32, y as i32));
+            match click_type {
+                ClickType::Right => {
+                    // Need main bar ID to parent the popup
+                    let Some(parent) = state.main_bar_id else {
+                        eprintln!("No main bar ID yet, can't open popup");
+                        return iced::Task::none();
+                    };
+
+                    // Close any existing popup first
+                    let close_task = if let Some(existing_id) = state.active_popup.take() {
+                        state.popup_for_address = None;
+                        iced::Task::done(Message::CloseWindow(existing_id))
+                    } else {
+                        iced::Task::none()
+                    };
+
+                    // Open a popup menu below the icon
+                    let popup = window::Id::unique();
+                    state.active_popup = Some(popup);
+                    state.popup_for_address = Some(address);
+
+                    // Position: center below the clicked icon, clamped to bar width
+                    let menu_width = 200i32;
+                    let menu_height = 80i32;
+                    let bar_w = state.bar_width as i32;
+                    let (mouse_x, _mouse_y) = state.mouse_position;
+                    let margin = 4i32;
+
+                    // Prefer centered under click, clamp to bar edges
+                    let prefer_center = (mouse_x as i32) - (menu_width / 2);
+                    let min_x = margin;
+                    let max_x = bar_w - menu_width - margin;
+                    let x = prefer_center.clamp(min_x, max_x.max(min_x));
+
+                    let y = 30 + 6; // bar height + gap
+
+                    let open_task = iced::Task::done(Message::OpenPopup {
+                        parent,
+                        popup,
+                        settings: IcedNewPopupSettings {
+                            size: (menu_width as u32, menu_height as u32),
+                            position: (x, y),
+                        },
+                    });
+
+                    return iced::Task::batch([close_task, open_task]);
+                }
+                _ => {
+                    // Left and middle click - send to DBus
+                    if let Some(tx) = ACTIVATE_TX.get() {
+                        let (x, y) = state.mouse_position;
+                        let _ = tx.send((address, click_type, x as i32, y as i32));
+                    }
+                }
+            }
+        }
+        Message::ClosePopup => {
+            if let Some(id) = state.active_popup.take() {
+                state.popup_for_address = None;
+                return iced::Task::done(Message::CloseWindow(id));
+            }
+        }
+        Message::WindowResized(id, size) => {
+            // Capture the main bar ID from the first window event (bar is first window)
+            if state.main_bar_id.is_none() && size.width > 100.0 {
+                state.main_bar_id = Some(id);
+                eprintln!("Captured main bar ID: {:?}, width: {}", id, size.width);
+            }
+            // Only track bar width from the main window, not popups
+            if state.main_bar_id == Some(id) {
+                state.bar_width = size.width as u32;
             }
         }
         Message::TrayIconHover(address, is_hovered) => {
@@ -112,7 +217,8 @@ fn update(state: &mut State, msg: Message) -> iced::Task<Message> {
         Message::MouseMoved(point) => {
             state.mouse_position = (point.x, point.y);
         }
-        _ => {}
+        // OpenPopup and CloseWindow are handled by TryInto -> layershell, not here
+        Message::OpenPopup { .. } | Message::CloseWindow(_) => {}
     }
     iced::Task::none()
 }
@@ -221,7 +327,14 @@ fn tray_icon_container_style(hovered: bool) -> container::Style {
     }
 }
 
-fn view(state: &State) -> Element<'_, Message> {
+fn view(state: &State, window_id: window::Id) -> Element<'_, Message> {
+    // Only render bar for the main bar window - anything else gets popup view
+    // This prevents flickering where unknown windows briefly show bar content
+    if state.main_bar_id != Some(window_id) {
+        return view_popup(state);
+    }
+
+    // Main bar view
     let tray_icons: Vec<Element<'_, Message>> = state
         .tray_items
         .iter()
@@ -283,9 +396,57 @@ fn view(state: &State) -> Element<'_, Message> {
     .into()
 }
 
-fn theme(_state: &State) -> Theme {
+// Dark Prism menu colors
+const MENU_BG: Color = Color::from_rgb(24.0 / 255.0, 24.0 / 255.0, 27.0 / 255.0);
+const MENU_TEXT: Color = Color::from_rgb(244.0 / 255.0, 244.0 / 255.0, 245.0 / 255.0);
+const MENU_BORDER: Color = Color::from_rgba(255.0 / 255.0, 255.0 / 255.0, 255.0 / 255.0, 0.1);
+
+fn view_popup(state: &State) -> Element<'_, Message> {
+    use iced::widget::{button, column, text};
+
+    let label = state.popup_for_address
+        .as_ref()
+        .map(|a| format!("Menu for {}", a))
+        .unwrap_or_else(|| "Menu".to_string());
+
+    // Single container fills the window with rounded corners
+    // The transparent app background allows corners to show through
+    container(
+        column![
+            text(label).size(12).color(MENU_TEXT),
+            button(text("Close").size(12).color(MENU_TEXT))
+                .on_press(Message::ClosePopup)
+                .padding(4),
+        ]
+        .spacing(6)
+        .padding(8),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .style(|_| container::Style {
+        background: Some(Background::Color(MENU_BG)),
+        border: Border {
+            radius: 8.0.into(),
+            width: 1.0,
+            color: MENU_BORDER,
+        },
+        ..Default::default()
+    })
+    .into()
+}
+
+fn theme(_state: &State, _window_id: window::Id) -> Theme {
     Theme::Dark
 }
+
+// App style with transparent background (allows rounded corners on popups)
+fn style(_state: &State, theme: &Theme) -> iced::theme::Style {
+    iced::theme::Style {
+        background_color: Color::TRANSPARENT,
+        text_color: theme.palette().text,
+    }
+}
+
 
 async fn lookup_full_sni_address(bus_name: &str) -> zbus::Result<String> {
     let conn = Connection::session().await?;
@@ -369,11 +530,18 @@ async fn sni_secondary_activate(bus_name: &str, x: i32, y: i32) -> zbus::Result<
 fn subscription(_state: &State) -> Subscription<Message> {
     Subscription::batch([
         Subscription::run(tray_subscription),
-        iced::event::listen_with(|event, _status, _id| {
-            if let iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) = event {
-                Some(Message::MouseMoved(position))
-            } else {
-                None
+        iced::event::listen_with(|event, _status, id| {
+            match event {
+                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
+                    Some(Message::MouseMoved(position))
+                }
+                iced::Event::Window(iced::window::Event::Resized(size)) => {
+                    Some(Message::WindowResized(id, size))
+                }
+                iced::Event::Window(iced::window::Event::Opened { size, .. }) => {
+                    Some(Message::WindowResized(id, size))
+                }
+                _ => None
             }
         }),
     ])
@@ -551,7 +719,8 @@ enum TrayState {
 }
 
 pub fn main() -> Result<(), iced_layershell::Error> {
-    application(init, namespace, update, view)
+    daemon(init, namespace, update, view)
+        .style(style)
         .theme(theme)
         .subscription(subscription)
         .settings(Settings {
