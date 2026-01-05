@@ -3,3 +3,6 @@
 .claude/oracle-state.json
 .claude/settings.local.json
 .playwright-mcp/
+
+ironbar/
+cosmic-applets/
